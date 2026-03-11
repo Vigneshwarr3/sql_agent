@@ -1,0 +1,454 @@
+\documentclass[12pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{microtype}
+
+% ── Hyperref config ───────────────────────────────────────────────────────────
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=blue,
+    citecolor=black,
+}
+
+% ── Section styling ───────────────────────────────────────────────────────────
+\titleformat{\section}{\large\bfseries}{}{0em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+
+% ── SQL code listing style ────────────────────────────────────────────────────
+\lstdefinestyle{sql}{
+    language=SQL,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    stringstyle=\color{red!70!black},
+    commentstyle=\color{gray}\itshape,
+    backgroundcolor=\color{gray!8},
+    frame=single,
+    rulecolor=\color{gray!40},
+    framesep=4pt,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=2,
+    captionpos=b,
+}
+
+\lstdefinestyle{prompt}{
+    basicstyle=\ttfamily\footnotesize,
+    backgroundcolor=\color{blue!4},
+    frame=single,
+    rulecolor=\color{blue!30},
+    framesep=4pt,
+    breaklines=true,
+    showstringspaces=false,
+}
+
+% ── Document ──────────────────────────────────────────────────────────────────
+\begin{document}
+
+% ── Title page ────────────────────────────────────────────────────────────────
+\begin{titlepage}
+    \centering
+    \vspace*{2cm}
+    {\LARGE\bfseries Natural Language to SQL:\\[0.4em]
+    Building a Text-to-SQL Agent for the Chicago Crime Dataset\par}
+    \vspace{1.5cm}
+    {\large Applied Data Science --- NLP Project\par}
+    \vspace{0.5cm}
+    {\large\itshape Course Report\par}
+    \vspace{2cm}
+    {\normalsize March 2026\par}
+    \vfill
+    \hrule
+    \vspace{0.5cm}
+    {\small
+    \textbf{Dataset:} Chicago Crime Dataset (2020 -- Present)\\
+    \textbf{Database:} PostgreSQL (\texttt{chicago\_crime})\\
+    \textbf{Models evaluated:} \texttt{llama3.1:8b} (general-purpose) \ \textbullet\
+    \texttt{mannix/defog-llama3-sqlcoder-8b} (fine-tuned)
+    }
+    \vspace{0.5cm}
+    \hrule
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Project Overview}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The goal of this project was to build a system that accepts natural-language questions
+about crime in Chicago and returns accurate, data-backed answers by automatically
+generating and executing SQL queries against a live PostgreSQL database.
+
+The Chicago Crime dataset contains records from 2020 to the present, covering attributes
+such as crime type, date, district, arrest status, and geographic coordinates.
+Rather than hard-coding queries, we wanted an interface that any analyst could use
+without SQL knowledge.
+
+The core research question became: \textit{how well can an off-the-shelf or fine-tuned
+language model generate correct SQL on its own, with no retrieval step and no training
+on our specific schema?}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{What Went Well}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{RAG was not needed}
+
+Early in the project we planned to use \textbf{Retrieval-Augmented Generation (RAG)}
+as a core part of the pipeline.  The intuition was that the database schema and any
+relevant data samples would first be retrieved from a vector store based on the
+user's question, and only then passed to the LLM.  This added a significant layer of
+complexity: we would have needed to embed the schema, maintain a vector index,
+implement a retriever, and manage chunking strategies for the DDL.
+
+We discovered that the schema for our database is compact enough to fit entirely
+inside the LLM's context window --- the \texttt{chicago\_crime} table has a
+manageable number of columns and a single-table schema. This meant we could
+\textbf{inject the full DDL directly into the prompt} on every call without any
+retrieval step.
+
+This simplification had several benefits:
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+    \item \textbf{Reduced infrastructure:} no vector database, no embedding model,
+          no retrieval latency.
+    \item \textbf{Deterministic context:} the model always sees all columns, avoiding
+          the risk of a retriever omitting a relevant field.
+    \item \textbf{Faster iteration:} the pipeline became a straightforward
+          \emph{prompt $\rightarrow$ LLM $\rightarrow$ SQL $\rightarrow$ execute}
+          chain.
+\end{itemize}
+
+\subsection{LangGraph agent worked end-to-end}
+
+The multi-step LangGraph agent (using \texttt{llama3.1:8b}) successfully completed
+the full pipeline: listing tables $\to$ fetching schema $\to$ generating SQL $\to$
+reviewing SQL $\to$ executing $\to$ summarising.  This validated the architecture
+and provided a strong baseline to compare against.
+
+\subsection{Robust fallback handling}
+
+Because Ollama models sometimes emit plain JSON or raw SQL text instead of structured
+tool calls, a three-pass fallback strategy was implemented in \texttt{sql\_agent.py}.
+This made the LangGraph agent resilient to model output variation without requiring
+a fine-tuned model.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Model Comparison: \texttt{llama3.1:8b} vs.\ SQLCoder}
+% ─────────────────────────────────────────────────────────────────────────────
+
+We evaluated two models under the same database and the same natural-language questions.
+Table~\ref{tab:model_comparison} summarises the key differences.
+
+\begin{table}[H]
+\centering
+\caption{High-level comparison of the two evaluated models}
+\label{tab:model_comparison}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{lll}
+\toprule
+\textbf{Property} & \textbf{llama3.1:8b} & \textbf{SQLCoder (defog-llama3-8b)} \\
+\midrule
+Training objective     & General-purpose chat       & Fine-tuned for text-to-SQL \\
+Tool / function calls  & Supported (unreliable)     & Not supported \\
+How SQL is requested   & Tool call (\texttt{sql\_db\_query}) & Completion from prompt \\
+Schema delivery        & Via schema tool in loop    & Full DDL injected in prompt \\
+Pipeline complexity    & Multi-step LangGraph graph & Single-pass prompt chain \\
+Identifier quoting     & Requires explicit prompting & Learned from fine-tuning \\
+Hallucinated columns   & Occasional                 & Rare \\
+Execution success rate & Moderate (needs fallbacks) & Higher out-of-the-box \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Why a general-purpose model underperforms on SQL}
+
+\texttt{llama3.1:8b} is a strong general reasoning model, but it was not trained
+specifically for SQL generation.  Several practical problems surfaced during evaluation:
+
+\begin{enumerate}[leftmargin=*, itemsep=3pt]
+    \item \textbf{Unreliable tool invocation.}  The model occasionally ignored the
+          \texttt{tool\_choice="any"} instruction and printed a JSON object in plain
+          text rather than making a structured tool call.  Custom fallback parsing was
+          required.
+
+    \item \textbf{Identifier quoting.}  Column names that contain spaces or mixed case
+          (e.g.\ \texttt{Primary Type}, \texttt{Location Description}) were sometimes
+          left unquoted or wrapped in backticks instead of PostgreSQL-style double
+          quotes, causing \texttt{syntax error} exceptions.
+
+    \item \textbf{Table name hallucination.}  Without explicit instruction, the model
+          occasionally invented table names (\texttt{crimes}, \texttt{crime\_data})
+          that do not exist in the database.
+
+    \item \textbf{Query complexity.}  For multi-step aggregation questions the model
+          sometimes produced overly complex subqueries or omitted a GROUP BY clause.
+\end{enumerate}
+
+SQLCoder, by contrast, was fine-tuned on a corpus of (schema, question, SQL) triples.
+It has internalised the PostgreSQL quoting conventions, JOIN patterns, and GROUP BY
+idioms expected in analytical queries.  Given the same schema and question, it
+consistently produces syntactically correct, executable SQL on the first attempt.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Query Comparison: Same Question, Two Models}
+% ─────────────────────────────────────────────────────────────────────────────
+
+To illustrate the difference concretely, we ran both models against the same questions
+using the same database schema.  The relevant portion of the schema is shown below.
+
+\begin{lstlisting}[style=sql, caption={Relevant schema (chicago\_crime table)}]
+CREATE TABLE chicago_crime (
+    "ID"                   BIGINT,
+    "Case Number"          TEXT,
+    "Date"                 TEXT,
+    "Block"                TEXT,
+    "IUCR"                 TEXT,
+    "Primary Type"         TEXT,
+    "Description"          TEXT,
+    "Location Description" TEXT,
+    "Arrest"               BOOLEAN,
+    "Domestic"             BOOLEAN,
+    "Beat"                 INTEGER,
+    "District"             INTEGER,
+    "Ward"                 DOUBLE PRECISION,
+    "Community Area"       DOUBLE PRECISION,
+    "FBI Code"             TEXT,
+    "X Coordinate"         DOUBLE PRECISION,
+    "Y Coordinate"         DOUBLE PRECISION,
+    "Year"                 INTEGER,
+    "Updated On"           TEXT,
+    "Latitude"             DOUBLE PRECISION,
+    "Longitude"            DOUBLE PRECISION,
+    "Location"             TEXT,
+    crime_type             TEXT
+);
+\end{lstlisting}
+
+\subsection{Question 1: ``Which year had the most number of crimes?''}
+
+\textbf{llama3.1:8b} was given this system prompt and bound to the
+\texttt{sql\_db\_query} tool via the LangGraph \texttt{generate\_query} node:
+
+\begin{lstlisting}[style=prompt, caption={System prompt delivered to llama3.1:8b}]
+You are a PostgreSQL SQL expert.
+Write a precise SELECT query for the question and call sql_db_query.
+Use only column names that exist in the provided schema.
+Rules:
+- Enclose ALL column names in double quotes exactly as they appear in the schema.
+- Use single quotes for string literals.
+- Limit results to at most 3 rows unless the user asks otherwise.
+- NEVER issue DML statements (INSERT, UPDATE, DELETE, DROP, etc.).
+\end{lstlisting}
+
+\noindent\textbf{Query generated by llama3.1:8b:}
+
+\begin{lstlisting}[style=sql, caption={llama3.1:8b output for Question 1}]
+SELECT year, COUNT(*) AS crime_count
+FROM chicago_crime
+GROUP BY year
+ORDER BY crime_count DESC
+LIMIT 1;
+\end{lstlisting}
+
+\noindent\textit{Issue:} The identifier \texttt{year} is left unquoted.  PostgreSQL
+treats \texttt{year} as a reserved word in some dialects and, more critically, the
+column is stored as \texttt{"Year"} (capital Y) in this case-sensitive database.
+This query raises \texttt{column "year" does not exist}.
+
+\vspace{0.8em}
+\noindent\textbf{SQLCoder} received the full DDL inside the structured prompt template:
+
+\begin{lstlisting}[style=prompt, caption={SQLCoder prompt template (abbreviated)}]
+### Task
+Generate a SQL query to answer [QUESTION]Which year had the most number
+of crimes?[/QUESTION]
+
+### Database Schema
+<full CREATE TABLE DDL injected here>
+
+### Answer
+Given the database schema, here is the SQL query that answers
+[QUESTION]Which year had the most number of crimes?[/QUESTION]
+[SQL]
+\end{lstlisting}
+
+\noindent\textbf{Query generated by SQLCoder:}
+
+\begin{lstlisting}[style=sql, caption={SQLCoder output for Question 1}]
+SELECT "Year", COUNT(*) AS crime_count
+FROM chicago_crime
+GROUP BY "Year"
+ORDER BY crime_count DESC
+LIMIT 1;
+\end{lstlisting}
+
+\noindent\textit{Result:} Correct PostgreSQL quoting.  Executes successfully and
+returns the year with the highest crime count.
+
+\vspace{1em}
+
+\subsection{Question 2: ``What are the top 10 crime types by count?''}
+
+\noindent\textbf{Query generated by llama3.1:8b:}
+
+\begin{lstlisting}[style=sql, caption={llama3.1:8b output for Question 2}]
+SELECT "Primary Type", COUNT(*) AS crime_count
+FROM chicago_crime
+GROUP BY "Primary Type"
+ORDER BY crime_count DESC
+LIMIT 10;
+\end{lstlisting}
+
+\noindent\textit{Result:} Correct in this instance.  The model properly quoted
+\texttt{"Primary Type"} here, but this was inconsistent across runs (the fallback
+check-query node corrected earlier failures in the same session).
+
+\vspace{0.8em}
+\noindent\textbf{Query generated by SQLCoder:}
+
+\begin{lstlisting}[style=sql, caption={SQLCoder output for Question 2}]
+SELECT "Primary Type", COUNT(*) AS num_crimes
+FROM chicago_crime
+GROUP BY "Primary Type"
+ORDER BY num_crimes DESC
+LIMIT 10;
+\end{lstlisting}
+
+\noindent\textit{Result:} Consistently correct across multiple runs with no
+fallback required.
+
+\vspace{1em}
+
+\subsection{Question 3: ``Which district has the highest number of arrests?''}
+
+\noindent\textbf{Query generated by llama3.1:8b} (after check-query correction):
+
+\begin{lstlisting}[style=sql, caption={llama3.1:8b output for Question 3 (post check-query)}]
+SELECT "District", COUNT(*) AS arrest_count
+FROM chicago_crime
+WHERE "Arrest" = TRUE
+GROUP BY "District"
+ORDER BY arrest_count DESC
+LIMIT 1;
+\end{lstlisting}
+
+\noindent\textbf{Query generated by SQLCoder:}
+
+\begin{lstlisting}[style=sql, caption={SQLCoder output for Question 3}]
+SELECT "District", COUNT(*) AS arrest_count
+FROM chicago_crime
+WHERE "Arrest" = true
+GROUP BY "District"
+ORDER BY arrest_count DESC
+LIMIT 1;
+\end{lstlisting}
+
+\noindent Both models produced equivalent queries for this question.  The difference
+here was in the number of pipeline steps required: \texttt{llama3.1:8b} needed the
+check-query review node to correct an initial attempt that omitted the
+\texttt{WHERE} clause, while SQLCoder generated the correct query on the first pass.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Key Findings}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\begin{enumerate}[leftmargin=*, itemsep=4pt]
+    \item \textbf{Fine-tuned beats general-purpose for SQL.}  SQLCoder's domain-specific
+          training delivers consistently correct, executable SQL with no multi-step
+          review cycle.  For a production text-to-SQL system, a fine-tuned model is
+          the better choice.
+
+    \item \textbf{RAG is unnecessary at this schema scale.}  Injecting the full DDL
+          directly into the prompt was sufficient.  A RAG layer would have added
+          infrastructure complexity with no accuracy benefit.
+
+    \item \textbf{LangGraph adds robustness for weaker models.}  The multi-node
+          graph (generate $\to$ check $\to$ execute) acts as a safety net for
+          general-purpose models that produce imperfect SQL.  This overhead is
+          unnecessary with SQLCoder.
+
+    \item \textbf{Prompt engineering matters.}  The structured SQLCoder prompt template
+          (\texttt{[QUESTION]…[/QUESTION]} / \texttt{[SQL]}) is critical for getting
+          reliable completions.  Using a plain instruction-style prompt with SQLCoder
+          degrades output quality.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Next Steps}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Fine-tune SQLCoder on the Chicago Crime schema}
+
+While SQLCoder performs well zero-shot, it occasionally produces queries that use
+the wrong column alias or miss a domain-specific filter (e.g.\ filtering by
+\texttt{crime\_type} vs.\ \texttt{"Primary Type"}).  Fine-tuning on a small set of
+(question, SQL) pairs specific to the Chicago Crime database would further close this gap.
+
+\subsection{Add a self-correction loop to the SQLCoder pipeline}
+
+The LangGraph agent has a built-in check-query node that reviews SQL before execution.
+A similar loop should be added to the SQLCoder pipeline: if \texttt{db.run(sql)}
+raises an exception, feed the error message back to the model with a
+\textit{``Fix this SQL error''} prompt and retry.
+
+\subsection{Evaluate on a broader question set}
+
+Current evaluation was qualitative and limited to a handful of questions.  A
+structured benchmark with ground-truth SQL (e.g.\ Spider, BIRD, or a custom
+Chicago Crime test set) would give a quantitative execution accuracy score and
+expose failure modes more systematically.
+
+\subsection{Expose as an API / chat interface}
+
+Wrap the SQLCoder pipeline in a FastAPI endpoint or a Streamlit chat UI so that
+non-technical analysts can query the dataset interactively without opening a
+notebook.
+
+\subsection{Support multi-table schemas}
+
+The current database has a single denormalised table.  Extending the system to a
+normalised schema (e.g.\ separating \texttt{district}, \texttt{location}, and
+\texttt{crime} into linked tables) would test how well each model handles JOIN
+queries and foreign-key relationships.
+
+\subsection{Streaming and latency optimisation}
+
+SQLCoder at 8B parameters on a local Ollama instance has a noticeable generation
+latency, especially with a long DDL in the prompt.  Options to explore:
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+    \item Quantised (Q4/Q5) model variants to reduce memory and latency.
+    \item Schema caching: keep the tokenised DDL prefix cached in KV-cache (prefix
+          caching, supported by vLLM).
+    \item Moving to a larger, hosted SQLCoder variant (e.g.\ \texttt{sqlcoder-70b})
+          for higher-accuracy production use.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+% ─────────────────────────────────────────────────────────────────────────────
+
+This project demonstrated that a specialised, fine-tuned SQL generation model
+(SQLCoder) outperforms a general-purpose model (llama3.1:8b) in a text-to-SQL
+setting, even at the same parameter count.  Crucially, the complexity we initially
+anticipated --- a full RAG pipeline with vector retrieval --- turned out to be
+unnecessary.  Injecting the compact schema directly into the prompt was both simpler
+and more reliable.
+
+The system successfully answers natural-language questions about the Chicago Crime
+dataset with no manual SQL writing, demonstrating that production-quality
+text-to-SQL is achievable with open-source local models on modest hardware.
+
+\end{document}
